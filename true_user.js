@@ -1,5 +1,6 @@
 import http from "k6/http";
 import { check, sleep } from "k6";
+import { Trend, Rate, Counter } from "k6/metrics";
 import {
   randomIntBetween,
   randomItem,
@@ -22,9 +23,9 @@ import {
  *      - Sometimes:
  *          Auth:   GET /lumps/summary/team/:teamId
  *
- * Distribution support:
- *  - USER_OFFSET lets you run the same script on multiple loadgens
- *    without reusing the same test users.
+ * NOTE:
+ *  - Adds custom per-endpoint metrics (duration, fail rate, req count),
+ *    and prints them in a compact summary at the end.
  */
 
 // ------------------------
@@ -77,7 +78,7 @@ const TEAM_IDS = [
 ];
 
 // ------------------------
-// k6 OPTIONS (1 hour)
+// k6 OPTIONS
 // ------------------------
 export const options = {
   scenarios: {
@@ -89,13 +90,76 @@ export const options = {
   },
   thresholds: {
     http_req_failed: ["rate<0.01"], // overall failure rate < 1%
-    http_req_duration: ["p(95)<800"], // tune these to your reality
+    http_req_duration: ["p(95)<800"], // tune to your reality
   },
   tags: {
     test_tag: TEST_TAG,
     test_type: "true_user",
   },
 };
+
+// ------------------------
+// Per-endpoint custom metrics
+// ------------------------
+// We keep these as separate metrics so they appear in the end summary,
+// AND we also print a compact custom table in handleSummary().
+const EP = {
+  latest: {
+    reqs: new Counter("ep_latest_reqs"),
+    fails: new Counter("ep_latest_fails"),
+    dur: new Trend("ep_latest_duration", true),
+  },
+  login: {
+    reqs: new Counter("ep_login_reqs"),
+    fails: new Counter("ep_login_fails"),
+    dur: new Trend("ep_login_duration", true),
+  },
+  userTeams: {
+    reqs: new Counter("ep_user_teams_reqs"),
+    fails: new Counter("ep_user_teams_fails"),
+    dur: new Trend("ep_user_teams_duration", true),
+  },
+  teamFeed: {
+    reqs: new Counter("ep_team_feed_reqs"),
+    fails: new Counter("ep_team_feed_fails"),
+    dur: new Trend("ep_team_feed_duration", true),
+  },
+  gamesScreen: {
+    reqs: new Counter("ep_games_screen_reqs"),
+    fails: new Counter("ep_games_screen_fails"),
+    dur: new Trend("ep_games_screen_duration", true),
+  },
+  teamTop: {
+    reqs: new Counter("ep_team_top_reqs"),
+    fails: new Counter("ep_team_top_fails"),
+    dur: new Trend("ep_team_top_duration", true),
+  },
+  summary: {
+    reqs: new Counter("ep_summary_reqs"),
+    fails: new Counter("ep_summary_fails"),
+    dur: new Trend("ep_summary_duration", true),
+  },
+  comments: {
+    reqs: new Counter("ep_comments_reqs"),
+    fails: new Counter("ep_comments_fails"),
+    dur: new Trend("ep_comments_duration", true),
+  },
+};
+
+// Optional: a global rate you can use in thresholds later if you want.
+// (Not required for the table.)
+const epAnyFailRate = new Rate("ep_any_fail_rate");
+
+function recordEndpoint(epObj, res) {
+  epObj.reqs.add(1);
+  epObj.dur.add(res.timings.duration);
+
+  const failed = res.status < 200 || res.status >= 300;
+  if (failed) epObj.fails.add(1);
+
+  // For a quick overall signal (optional)
+  epAnyFailRate.add(failed ? 1 : 0);
+}
 
 function logDebug(msg, obj) {
   if (!DEBUG) return;
@@ -147,13 +211,10 @@ function guestHeaders() {
 }
 
 function extractAfterDateFromLumps(respJson) {
-  // Best-effort: pick newest created_at or updated_at from response lumps list
-  // If shape differs, returns null and we just skip after_date refresh.
   try {
     const lumps = respJson?.lumps;
     if (!Array.isArray(lumps) || lumps.length === 0) return null;
 
-    // Prefer updated_at if present, else created_at
     let newest = null;
     for (const l of lumps) {
       const t = l?.updated_at || l?.created_at || null;
@@ -170,7 +231,7 @@ function extractAfterDateFromLumps(respJson) {
  * Extract up to N "valid" lump ids from a feed response.
  * Supports common shapes:
  *  - { lumps: [{ id, ... }, ...] }
- *  - { top_lumps: [...] } or other accidental variants (best-effort)
+ *  - { top_lumps: [...] } (best-effort)
  */
 function extractLumpIds(respJson, maxIds) {
   try {
@@ -185,7 +246,6 @@ function extractLumpIds(respJson, maxIds) {
     const seen = new Set();
 
     for (const item of candidates) {
-      // accept id as number or numeric string
       const raw = item?.id ?? item?.lump_id ?? null;
       if (raw === null || raw === undefined) continue;
 
@@ -207,15 +267,17 @@ function extractLumpIds(respJson, maxIds) {
 
 /**
  * Call /comments/thread for each lump_id.
- * Uses the same headers context as the feed call (guest for public feeds, auth for authed feeds).
+ * Tracks per-endpoint metrics + checks.
  */
 function hitCommentsThreads(lumpIds, reqParams, labelPrefix) {
   for (let i = 0; i < lumpIds.length; i++) {
     const lumpId = lumpIds[i];
+
     const r = http.get(
       `${BASE_URL}/comments/thread?lump_id=${encodeURIComponent(lumpId)}`,
       reqParams
     );
+    recordEndpoint(EP.comments, r);
 
     check(r, {
       [`${labelPrefix} /comments/thread 200`]: (x) => x.status === 200,
@@ -230,7 +292,6 @@ function hitCommentsThreads(lumpIds, reqParams, labelPrefix) {
       [`${labelPrefix} /comments/thread lump_id match`]: (x) => {
         try {
           const j = x.json();
-          // API returns lump_id as number in your sample
           return Number(j?.lump_id) === Number(lumpId);
         } catch (_) {
           return false;
@@ -243,15 +304,17 @@ function hitCommentsThreads(lumpIds, reqParams, labelPrefix) {
 /**
  * Wrapper: every time you hit a feed endpoint, ALSO hit comments/thread
  * for up to COMMENTS_PER_FEED valid lump ids from that response.
+ *
+ * Also records per-endpoint metrics for the feed itself.
  */
-function getFeedWithComments(url, reqParams, feedLabel) {
+function getFeedWithComments(url, reqParams, feedLabel, epMetricObj) {
   const res = http.get(url, reqParams);
+  if (epMetricObj) recordEndpoint(epMetricObj, res);
 
   check(res, {
     [`${feedLabel} 200`]: (r) => r.status === 200,
   });
 
-  // Only attempt comments if the feed succeeded and JSON parses
   if (res.status === 200) {
     let j = null;
     try {
@@ -285,27 +348,35 @@ export default function () {
   // ------------------------
   const vuBase = USER_OFFSET + (__VU - 1); // 0-based
   const userNum = (vuBase % USER_COUNT) + 1; // 1..USER_COUNT
-  // Pattern you described: testuser00## => 0001..0099 => testuser0001@chunky.test
   const email = `${USER_PREFIX}${pad4(userNum)}@${USER_DOMAIN}`;
 
   // ------------------------
-  // 1) Guest: /lumps/latest (+ comments threads for 3 lump_ids)
+  // 1) Guest: /lumps/latest (+ comments threads)
   // ------------------------
-  getFeedWithComments(`${BASE_URL}/lumps/latest`, guestHeaders(), "guest /lumps/latest");
+  getFeedWithComments(
+    `${BASE_URL}/lumps/latest`,
+    guestHeaders(),
+    "guest /lumps/latest",
+    EP.latest
+  );
   jitterSleep(SLEEP_AFTER_LATEST);
 
   // ------------------------
   // 2) Login
   // ------------------------
   const loginPayload = JSON.stringify({ email, password: PASSWORD });
+  const loginRes = http.post(
+    `${BASE_URL}/users/login`,
+    loginPayload,
+    guestHeaders()
+  );
+  recordEndpoint(EP.login, loginRes);
 
-  const loginRes = http.post(`${BASE_URL}/users/login`, loginPayload, guestHeaders());
   const loginOk = check(loginRes, {
     "login 200": (r) => r.status === 200,
   });
 
   if (!loginOk) {
-    // fail-soft: don’t spam the API with downstream auth calls if login fails
     logDebug("login failed", {
       status: loginRes.status,
       body: loginRes.body?.slice?.(0, 200),
@@ -325,15 +396,15 @@ export default function () {
   jitterSleep(SLEEP_AFTER_LOGIN);
 
   // ------------------------
-  // 3) Authorized: /lumps/user-teams (after_date sometimes once/twice)
-  //    (+ comments threads for 3 lump_ids each time)
+  // 3) Authorized: /lumps/user-teams (+ comments threads)
   // ------------------------
   const authReq = authHeaders(token);
 
   const ut1 = getFeedWithComments(
     `${BASE_URL}/lumps/user-teams`,
     authReq,
-    "auth /lumps/user-teams"
+    "auth /lumps/user-teams",
+    EP.userTeams
   );
 
   const userTeamsCursor = ut1.cursor;
@@ -341,16 +412,22 @@ export default function () {
 
   if (userTeamsCursor) {
     getFeedWithComments(
-      `${BASE_URL}/lumps/user-teams?after_date=${encodeURIComponent(userTeamsCursor)}`,
+      `${BASE_URL}/lumps/user-teams?after_date=${encodeURIComponent(
+        userTeamsCursor
+      )}`,
       authReq,
-      "auth /lumps/user-teams after_date"
+      "auth /lumps/user-teams after_date",
+      EP.userTeams
     );
 
     if (doTwice) {
       getFeedWithComments(
-        `${BASE_URL}/lumps/user-teams?after_date=${encodeURIComponent(userTeamsCursor)}`,
+        `${BASE_URL}/lumps/user-teams?after_date=${encodeURIComponent(
+          userTeamsCursor
+        )}`,
         authReq,
-        "auth /lumps/user-teams after_date x2"
+        "auth /lumps/user-teams after_date x2",
+        EP.userTeams
       );
     }
   }
@@ -364,11 +441,12 @@ export default function () {
   const teams = pickUniqueTeams(teamCount);
 
   for (const teamId of teams) {
-    // 4a) Public team feed (+ comments threads for 3 lump_ids each time)
+    // 4a) Public team feed (+ comments threads)
     const tf1 = getFeedWithComments(
       `${BASE_URL}/lumps/team/${teamId}`,
       guestHeaders(),
-      `guest /lumps/team/${teamId}`
+      `guest /lumps/team/${teamId}`,
+      EP.teamFeed
     );
 
     // sometimes do after_date refresh once/twice
@@ -377,16 +455,22 @@ export default function () {
 
     if (teamCursor) {
       getFeedWithComments(
-        `${BASE_URL}/lumps/team/${teamId}?after_date=${encodeURIComponent(teamCursor)}`,
+        `${BASE_URL}/lumps/team/${teamId}?after_date=${encodeURIComponent(
+          teamCursor
+        )}`,
         guestHeaders(),
-        `guest /lumps/team/${teamId} after_date`
+        `guest /lumps/team/${teamId} after_date`,
+        EP.teamFeed
       );
 
       if (teamTwice) {
         getFeedWithComments(
-          `${BASE_URL}/lumps/team/${teamId}?after_date=${encodeURIComponent(teamCursor)}`,
+          `${BASE_URL}/lumps/team/${teamId}?after_date=${encodeURIComponent(
+            teamCursor
+          )}`,
           guestHeaders(),
-          `guest /lumps/team/${teamId} after_date x2`
+          `guest /lumps/team/${teamId} after_date x2`,
+          EP.teamFeed
         );
       }
     }
@@ -394,19 +478,31 @@ export default function () {
     jitterSleep(SLEEP_BETWEEN_TEAM_ACTIONS);
 
     // 4b) Always together: games (public) + team top (auth)
-    const gamesRes = http.get(`${BASE_URL}/games/by-team/${teamId}/screen`, guestHeaders());
+    const gamesRes = http.get(
+      `${BASE_URL}/games/by-team/${teamId}/screen`,
+      guestHeaders()
+    );
+    recordEndpoint(EP.gamesScreen, gamesRes);
+
     check(gamesRes, {
       "guest /games/by-team/:id/screen 200": (r) => r.status === 200,
     });
 
     const topRes = http.get(`${BASE_URL}/lumps/team/${teamId}/top`, authReq);
+    recordEndpoint(EP.teamTop, topRes);
+
     check(topRes, {
       "auth /team/:id/top 200": (r) => r.status === 200,
     });
 
     // 4c) Sometimes: summary (auth)
     if (Math.random() < PROB_DO_SUMMARY) {
-      const sumRes = http.get(`${BASE_URL}/lumps/summary/team/${teamId}`, authReq);
+      const sumRes = http.get(
+        `${BASE_URL}/lumps/summary/team/${teamId}`,
+        authReq
+      );
+      recordEndpoint(EP.summary, sumRes);
+
       check(sumRes, {
         "auth /lumps/summary/team/:id 200": (r) => r.status === 200,
       });
@@ -414,4 +510,84 @@ export default function () {
 
     jitterSleep(SLEEP_BETWEEN_FEEDS);
   }
+}
+
+// ------------------------
+// Custom end-of-test summary table
+// ------------------------
+function fmtMs(x) {
+  if (x === null || x === undefined || !Number.isFinite(x)) return "-";
+  return `${x.toFixed(1)}ms`;
+}
+function fmtPct(x) {
+  if (x === null || x === undefined || !Number.isFinite(x)) return "-";
+  return `${(x * 100).toFixed(2)}%`;
+}
+function fmtInt(x) {
+  if (x === null || x === undefined || !Number.isFinite(x)) return "-";
+  return `${Math.round(x)}`;
+}
+
+function epRowFromData(data, name, prefix) {
+  const reqs = data.metrics[`${prefix}_reqs`]?.values?.count ?? 0;
+  const fails = data.metrics[`${prefix}_fails`]?.values?.count ?? 0;
+
+  const dur = data.metrics[`${prefix}_duration`]?.values || {};
+  const avg = dur.avg ?? null;
+  const p90 = dur["p(90)"] ?? null;
+  const p95 = dur["p(95)"] ?? null;
+  const max = dur.max ?? null;
+
+  const failRate = reqs > 0 ? fails / reqs : 0;
+
+  return {
+    name,
+    reqs,
+    fails,
+    failRate,
+    avg,
+    p90,
+    p95,
+    max,
+  };
+}
+
+export function handleSummary(data) {
+  const rows = [
+    epRowFromData(data, "GET /lumps/latest", "ep_latest"),
+    epRowFromData(data, "POST /users/login", "ep_login"),
+    epRowFromData(data, "GET /lumps/user-teams (+after)", "ep_user_teams"),
+    epRowFromData(data, "GET /lumps/team/:id (+after)", "ep_team_feed"),
+    epRowFromData(data, "GET /games/by-team/:id/screen", "ep_games_screen"),
+    epRowFromData(data, "GET /lumps/team/:id/top", "ep_team_top"),
+    epRowFromData(data, "GET /lumps/summary/team/:id", "ep_summary"),
+    epRowFromData(data, "GET /comments/thread", "ep_comments"),
+  ];
+
+  const header =
+    "\n=== Per-endpoint summary (custom) ===\n" +
+    "endpoint | reqs | fails | fail% | avg | p90 | p95 | max\n" +
+    "-------- | ----:| ----:| -----:| ----:| ---:| ---:| ---:\n";
+
+  const lines = rows
+    .map((r) => {
+      return [
+        r.name,
+        fmtInt(r.reqs).padStart(4),
+        fmtInt(r.fails).padStart(4),
+        fmtPct(r.failRate).padStart(6),
+        fmtMs(r.avg).padStart(8),
+        fmtMs(r.p90).padStart(8),
+        fmtMs(r.p95).padStart(8),
+        fmtMs(r.max).padStart(8),
+      ].join(" | ");
+    })
+    .join("\n");
+
+  const text = header + lines + "\n\n";
+
+  // Keep default stdout summary AND append our table.
+  return {
+    stdout: text,
+  };
 }
