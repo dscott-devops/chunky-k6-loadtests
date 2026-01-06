@@ -1,3 +1,43 @@
+// loadtests/true_user.js
+
+/**
+ * JSDOC BEGIN
+ * @file loadtests/true_user.js
+ * @kind k6_test
+ * @group LoadTest
+ * @summary Chunky Sports “True User” scenario with one login per VU and /users/me re-hydration checks.
+ *
+ * @description
+ * Scenario 1 behavior:
+ *  - Each VU logs in ONCE to obtain a token (unless token becomes invalid/expired).
+ *  - After login, immediately calls GET /users/me to validate token + simulate app bootstrap re-hydration.
+ *  - On subsequent iterations, skips login and calls GET /users/me once per iteration.
+ *  - If /users/me returns 401/403, the VU re-logins and continues.
+ *
+ * Original flow per iteration (preserved):
+ *  1) Guest: GET /lumps/latest (+ comments threads for 3 lump_ids)
+ *  2) (Now: login once per VU) POST /users/login (only if token missing/invalid)
+ *  2b) (New) Auth re-hydration: GET /users/me (same payload shape as login)
+ *  3) Authorized: GET /lumps/user-teams (after_date sometimes once/twice) (+ comments threads)
+ *  4) Pick 2–5 random teams:
+ *      - Public:  GET /lumps/team/:teamId (after_date sometimes once/twice) (+ comments threads)
+ *      - Always together:
+ *          Public: GET /games/by-team/:teamId/screen
+ *          Auth:   GET /lumps/team/:teamId/top
+ *      - Sometimes:
+ *          Auth:   GET /lumps/summary/team/:teamId
+ *
+ * Observability:
+ *  - Per-endpoint metrics: req count, fail count, duration (avg/p90/p95/max).
+ *  - Global timing breakdown: connecting, tls_handshaking, waiting.
+ *  - Compact custom table printed in handleSummary().
+ *
+ * @changelog
+ *  - 2026-01-05: Scenario 1: token cached per VU (one login per VU) + added GET /users/me after login and once per iteration.
+ *  - 2026-01-05: Added EP.me per-endpoint metrics and included in custom summary table.
+ * JSDOC END
+ */
+
 import http from "k6/http";
 import { check, sleep } from "k6";
 import { Trend, Rate, Counter } from "k6/metrics";
@@ -6,27 +46,6 @@ import {
   randomItem,
   uuidv4,
 } from "https://jslib.k6.io/k6-utils/1.4.0/index.js";
-
-/**
- * Chunky Sports "True User" scenario
- * Flow per iteration:
- *  1) Guest: GET /lumps/latest   (+ comments threads for 3 lump_ids)
- *  2) Login (unique user per VU): POST /users/login
- *  3) Authorized: GET /lumps/user-teams (after_date sometimes once/twice)
- *     (+ comments threads for 3 lump_ids each time)
- *  4) Pick 2–5 random teams:
- *      - Public:  GET /lumps/team/:teamId (after_date sometimes once/twice)
- *        (+ comments threads for 3 lump_ids each time)
- *      - Always together:
- *          Public: GET /games/by-team/:teamId/screen
- *          Auth:   GET /lumps/team/:teamId/top
- *      - Sometimes:
- *          Auth:   GET /lumps/summary/team/:teamId
- *
- * NOTE:
- *  - Adds custom per-endpoint metrics (duration, fail rate, req count),
- *    and prints them in a compact summary at the end.
- */
 
 // ------------------------
 // ENV / CONFIG
@@ -61,15 +80,15 @@ const SLEEP_BETWEEN_TEAM_ACTIONS = [0.4, 1.6];
 // Valid team IDs (excluding NFL invalid 33–61, using your list)
 const TEAM_IDS = [
   // NFL 1..32 (skip 33..61 invalid)
-  1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-  21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+  1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+  22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
   // NBA 63..92
   63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80,
   81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92,
-  // MLB 93..123 (note: 124 missing in your list)
+  // MLB 93..123
   93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108,
   109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123,
-  // NHL 123,125..154 (123 is Ducks in your list; 124 missing)
+  // NHL 123,125..154
   123, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138,
   139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153,
   154,
@@ -101,20 +120,13 @@ export const options = {
 // ------------------------
 // Global timing breakdown (client-side components)
 // ------------------------
-// We record these per request so we can compare:
-// - connecting: TCP connect time (client -> ALB)
-// - tls: TLS handshake time
-// - waiting: time to first byte (server processing + upstream waits)
 const T_CONNECTING = new Trend("timing_connecting", true);
 const T_TLS = new Trend("timing_tls_handshaking", true);
 const T_WAITING = new Trend("timing_waiting", true);
 
-
 // ------------------------
 // Per-endpoint custom metrics
 // ------------------------
-// We keep these as separate metrics so they appear in the end summary,
-// AND we also print a compact custom table in handleSummary().
 const EP = {
   latest: {
     reqs: new Counter("ep_latest_reqs"),
@@ -125,6 +137,11 @@ const EP = {
     reqs: new Counter("ep_login_reqs"),
     fails: new Counter("ep_login_fails"),
     dur: new Trend("ep_login_duration", true),
+  },
+  me: {
+    reqs: new Counter("ep_me_reqs"),
+    fails: new Counter("ep_me_fails"),
+    dur: new Trend("ep_me_duration", true),
   },
   userTeams: {
     reqs: new Counter("ep_user_teams_reqs"),
@@ -159,8 +176,6 @@ const EP = {
 };
 
 function recordTimingBreakdown(res) {
-  // k6 timings are in ms
-  // See: https://k6.io/docs/javascript-api/k6-http/response/#timings
   try {
     const t = res?.timings || {};
     if (Number.isFinite(t.connecting)) T_CONNECTING.add(t.connecting);
@@ -171,24 +186,17 @@ function recordTimingBreakdown(res) {
   }
 }
 
-
-// Optional: a global rate you can use in thresholds later if you want.
-// (Not required for the table.)
 const epAnyFailRate = new Rate("ep_any_fail_rate");
 
 function recordEndpoint(epObj, res) {
   epObj.reqs.add(1);
   epObj.dur.add(res.timings.duration);
-
-  // Record global timing components for this request
   recordTimingBreakdown(res);
 
   const failed = res.status < 200 || res.status >= 300;
   if (failed) epObj.fails.add(1);
-
   epAnyFailRate.add(failed ? 1 : 0);
 }
-
 
 function logDebug(msg, obj) {
   if (!DEBUG) return;
@@ -256,12 +264,6 @@ function extractAfterDateFromLumps(respJson) {
   }
 }
 
-/**
- * Extract up to N "valid" lump ids from a feed response.
- * Supports common shapes:
- *  - { lumps: [{ id, ... }, ...] }
- *  - { top_lumps: [...] } (best-effort)
- */
 function extractLumpIds(respJson, maxIds) {
   try {
     const candidates =
@@ -294,10 +296,6 @@ function extractLumpIds(respJson, maxIds) {
   }
 }
 
-/**
- * Call /comments/thread for each lump_id.
- * Tracks per-endpoint metrics + checks.
- */
 function hitCommentsThreads(lumpIds, reqParams, labelPrefix) {
   for (let i = 0; i < lumpIds.length; i++) {
     const lumpId = lumpIds[i];
@@ -330,12 +328,6 @@ function hitCommentsThreads(lumpIds, reqParams, labelPrefix) {
   }
 }
 
-/**
- * Wrapper: every time you hit a feed endpoint, ALSO hit comments/thread
- * for up to COMMENTS_PER_FEED valid lump ids from that response.
- *
- * Also records per-endpoint metrics for the feed itself.
- */
 function getFeedWithComments(url, reqParams, feedLabel, epMetricObj) {
   const res = http.get(url, reqParams);
   if (epMetricObj) recordEndpoint(epMetricObj, res);
@@ -371,6 +363,68 @@ function getFeedWithComments(url, reqParams, feedLabel, epMetricObj) {
   return { res, json: null, lumpIds: [], cursor: null };
 }
 
+/**
+ * Scenario 1 auth:
+ * - Login once per VU (token cached in VU runtime)
+ * - Then /users/me after login
+ * - Each iteration runs /users/me once to simulate re-hydration checks
+ * - If /users/me returns 401/403, token is invalidated and re-login occurs
+ */
+let VU_TOKEN = null;
+
+function doLogin(email) {
+  const loginPayload = JSON.stringify({ email, password: PASSWORD });
+  const loginRes = http.post(`${BASE_URL}/users/login`, loginPayload, guestHeaders());
+  recordEndpoint(EP.login, loginRes);
+
+  const ok = check(loginRes, {
+    "login 200": (r) => r.status === 200,
+  });
+
+  if (!ok) {
+    logDebug("login failed", {
+      email,
+      status: loginRes.status,
+      body: loginRes.body?.slice?.(0, 200),
+    });
+    return null;
+  }
+
+  let j = null;
+  try {
+    j = loginRes.json();
+  } catch (_) {
+    logDebug("login json parse failed", { email });
+    return null;
+  }
+
+  const token = j?.token || null;
+  if (!token) {
+    logDebug("login missing token", { email });
+    return null;
+  }
+
+  return token;
+}
+
+function doUsersMe(token) {
+  const req = authHeaders(token);
+  const meRes = http.get(`${BASE_URL}/users/me`, req);
+  recordEndpoint(EP.me, meRes);
+
+  const ok = check(meRes, {
+    "users/me 200": (r) => r.status === 200,
+  });
+
+  // If token is invalid/expired, signal caller to re-login.
+  if (!ok && (meRes.status === 401 || meRes.status === 403)) {
+    logDebug("users/me unauthorized", { status: meRes.status });
+    return { ok: false, invalidToken: true, res: meRes };
+  }
+
+  return { ok, invalidToken: false, res: meRes };
+}
+
 export default function () {
   // ------------------------
   // Unique user per VU (distributed friendly)
@@ -391,44 +445,41 @@ export default function () {
   jitterSleep(SLEEP_AFTER_LATEST);
 
   // ------------------------
-  // 2) Login
+  // 2) Auth bootstrap:
+  //    - Login ONCE per VU (cached token), unless missing/invalid
+  //    - Always hit /users/me once per iteration (realistic “rehydrate”)
   // ------------------------
-  const loginPayload = JSON.stringify({ email, password: PASSWORD });
-  const loginRes = http.post(
-    `${BASE_URL}/users/login`,
-    loginPayload,
-    guestHeaders()
-  );
-  recordEndpoint(EP.login, loginRes);
+  if (!VU_TOKEN) {
+    VU_TOKEN = doLogin(email);
+    if (!VU_TOKEN) {
+      jitterSleep([1.0, 2.5]);
+      return;
+    }
+    jitterSleep(SLEEP_AFTER_LOGIN);
 
-  const loginOk = check(loginRes, {
-    "login 200": (r) => r.status === 200,
-  });
+    // Immediately validate + rehydrate after login
+    const meAfterLogin = doUsersMe(VU_TOKEN);
+    if (meAfterLogin.invalidToken) {
+      VU_TOKEN = null;
+      jitterSleep([1.0, 2.5]);
+      return;
+    }
+  }
 
-  if (!loginOk) {
-    logDebug("login failed", {
-      status: loginRes.status,
-      body: loginRes.body?.slice?.(0, 200),
-    });
-    jitterSleep([1.0, 2.5]);
+  // Per-iteration re-hydration check (token saved, app starts, /users/me called)
+  const meThisIter = doUsersMe(VU_TOKEN);
+  if (meThisIter.invalidToken) {
+    // Token expired/invalid; re-login and continue next iteration
+    VU_TOKEN = null;
+    jitterSleep([0.8, 1.8]);
     return;
   }
 
-  const loginJson = loginRes.json();
-  const token = loginJson?.token;
-  if (!token) {
-    logDebug("login missing token", { email });
-    jitterSleep([1.0, 2.5]);
-    return;
-  }
-
-  jitterSleep(SLEEP_AFTER_LOGIN);
+  const authReq = authHeaders(VU_TOKEN);
 
   // ------------------------
   // 3) Authorized: /lumps/user-teams (+ comments threads)
   // ------------------------
-  const authReq = authHeaders(token);
-
   const ut1 = getFeedWithComments(
     `${BASE_URL}/lumps/user-teams`,
     authReq,
@@ -441,9 +492,7 @@ export default function () {
 
   if (userTeamsCursor) {
     getFeedWithComments(
-      `${BASE_URL}/lumps/user-teams?after_date=${encodeURIComponent(
-        userTeamsCursor
-      )}`,
+      `${BASE_URL}/lumps/user-teams?after_date=${encodeURIComponent(userTeamsCursor)}`,
       authReq,
       "auth /lumps/user-teams after_date",
       EP.userTeams
@@ -451,9 +500,7 @@ export default function () {
 
     if (doTwice) {
       getFeedWithComments(
-        `${BASE_URL}/lumps/user-teams?after_date=${encodeURIComponent(
-          userTeamsCursor
-        )}`,
+        `${BASE_URL}/lumps/user-teams?after_date=${encodeURIComponent(userTeamsCursor)}`,
         authReq,
         "auth /lumps/user-teams after_date x2",
         EP.userTeams
@@ -484,9 +531,7 @@ export default function () {
 
     if (teamCursor) {
       getFeedWithComments(
-        `${BASE_URL}/lumps/team/${teamId}?after_date=${encodeURIComponent(
-          teamCursor
-        )}`,
+        `${BASE_URL}/lumps/team/${teamId}?after_date=${encodeURIComponent(teamCursor)}`,
         guestHeaders(),
         `guest /lumps/team/${teamId} after_date`,
         EP.teamFeed
@@ -494,9 +539,7 @@ export default function () {
 
       if (teamTwice) {
         getFeedWithComments(
-          `${BASE_URL}/lumps/team/${teamId}?after_date=${encodeURIComponent(
-            teamCursor
-          )}`,
+          `${BASE_URL}/lumps/team/${teamId}?after_date=${encodeURIComponent(teamCursor)}`,
           guestHeaders(),
           `guest /lumps/team/${teamId} after_date x2`,
           EP.teamFeed
@@ -526,10 +569,7 @@ export default function () {
 
     // 4c) Sometimes: summary (auth)
     if (Math.random() < PROB_DO_SUMMARY) {
-      const sumRes = http.get(
-        `${BASE_URL}/lumps/summary/team/${teamId}`,
-        authReq
-      );
+      const sumRes = http.get(`${BASE_URL}/lumps/summary/team/${teamId}`, authReq);
       recordEndpoint(EP.summary, sumRes);
 
       check(sumRes, {
@@ -555,6 +595,20 @@ function fmtPct(x) {
 function fmtInt(x) {
   if (x === null || x === undefined || !Number.isFinite(x)) return "-";
   return `${Math.round(x)}`;
+}
+
+function metricVals(data, metricName) {
+  const v = data?.metrics?.[metricName]?.values || null;
+  return v || null;
+}
+
+function fmtTimingLine(label, v) {
+  if (!v) return `${label}: -`;
+  const avg = v.avg ?? null;
+  const p90 = v["p(90)"] ?? null;
+  const p95 = v["p(95)"] ?? null;
+  const max = v.max ?? null;
+  return `${label}: avg=${fmtMs(avg)} p90=${fmtMs(p90)} p95=${fmtMs(p95)} max=${fmtMs(max)}`;
 }
 
 function epRowFromData(data, name, prefix) {
@@ -584,7 +638,8 @@ function epRowFromData(data, name, prefix) {
 export function handleSummary(data) {
   const rows = [
     epRowFromData(data, "GET /lumps/latest", "ep_latest"),
-    epRowFromData(data, "POST /users/login", "ep_login"),
+    epRowFromData(data, "POST /users/login (once per VU)", "ep_login"),
+    epRowFromData(data, "GET /users/me", "ep_me"),
     epRowFromData(data, "GET /lumps/user-teams (+after)", "ep_user_teams"),
     epRowFromData(data, "GET /lumps/team/:id (+after)", "ep_team_feed"),
     epRowFromData(data, "GET /games/by-team/:id/screen", "ep_games_screen"),
@@ -612,10 +667,7 @@ export function handleSummary(data) {
       ].join(" | ");
     })
     .join("\n");
-    // Keep default stdout summary AND append our table.
-    // ------------------------
-  // Global timing breakdown line
-  // ------------------------
+
   const vConn = metricVals(data, "timing_connecting");
   const vTls = metricVals(data, "timing_tls_handshaking");
   const vWait = metricVals(data, "timing_waiting");
@@ -626,11 +678,8 @@ export function handleSummary(data) {
     fmtTimingLine("tls_handshaking", vTls) + "\n" +
     fmtTimingLine("waiting", vWait) + "\n\n";
 
+  const text = header + lines + "\n" + timingLine;
 
-   const text = header + lines + "\n" + timingLine;
-
-
-  
   return {
     stdout: text,
   };
