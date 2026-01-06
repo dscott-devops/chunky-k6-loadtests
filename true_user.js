@@ -374,7 +374,7 @@ let VU_TOKEN = null;
 
 function doLogin(email) {
   const loginPayload = JSON.stringify({ email, password: PASSWORD });
-  const loginRes = http.post(`${BASE_URL}/users/login`, loginPayload, guestHeaders());
+  const loginRes = http.post(`${BASE_URL}/auth/login`, loginPayload, guestHeaders());
   recordEndpoint(EP.login, loginRes);
 
   const ok = check(loginRes, {
@@ -409,16 +409,16 @@ function doLogin(email) {
 
 function doUsersMe(token) {
   const req = authHeaders(token);
-  const meRes = http.get(`${BASE_URL}/users/me`, req);
+  const meRes = http.get(`${BASE_URL}/auth/me`, req);
   recordEndpoint(EP.me, meRes);
 
   const ok = check(meRes, {
-    "users/me 200": (r) => r.status === 200,
+    "auth/me 200": (r) => r.status === 200,
   });
 
   // If token is invalid/expired, signal caller to re-login.
   if (!ok && (meRes.status === 401 || meRes.status === 403)) {
-    logDebug("users/me unauthorized", { status: meRes.status });
+    logDebug("auth/me unauthorized", { status: meRes.status });
     return { ok: false, invalidToken: true, res: meRes };
   }
 
@@ -638,8 +638,8 @@ function epRowFromData(data, name, prefix) {
 export function handleSummary(data) {
   const rows = [
     epRowFromData(data, "GET /lumps/latest", "ep_latest"),
-    epRowFromData(data, "POST /users/login (once per VU)", "ep_login"),
-    epRowFromData(data, "GET /users/me", "ep_me"),
+    epRowFromData(data, "POST /auth/login (once per VU)", "ep_login"),
+    epRowFromData(data, "GET /auth/me", "ep_me"),
     epRowFromData(data, "GET /lumps/user-teams (+after)", "ep_user_teams"),
     epRowFromData(data, "GET /lumps/team/:id (+after)", "ep_team_feed"),
     epRowFromData(data, "GET /games/by-team/:id/screen", "ep_games_screen"),
