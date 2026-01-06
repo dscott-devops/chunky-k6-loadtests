@@ -99,6 +99,18 @@ export const options = {
 };
 
 // ------------------------
+// Global timing breakdown (client-side components)
+// ------------------------
+// We record these per request so we can compare:
+// - connecting: TCP connect time (client -> ALB)
+// - tls: TLS handshake time
+// - waiting: time to first byte (server processing + upstream waits)
+const T_CONNECTING = new Trend("timing_connecting", true);
+const T_TLS = new Trend("timing_tls_handshaking", true);
+const T_WAITING = new Trend("timing_waiting", true);
+
+
+// ------------------------
 // Per-endpoint custom metrics
 // ------------------------
 // We keep these as separate metrics so they appear in the end summary,
@@ -146,6 +158,20 @@ const EP = {
   },
 };
 
+function recordTimingBreakdown(res) {
+  // k6 timings are in ms
+  // See: https://k6.io/docs/javascript-api/k6-http/response/#timings
+  try {
+    const t = res?.timings || {};
+    if (Number.isFinite(t.connecting)) T_CONNECTING.add(t.connecting);
+    if (Number.isFinite(t.tls_handshaking)) T_TLS.add(t.tls_handshaking);
+    if (Number.isFinite(t.waiting)) T_WAITING.add(t.waiting);
+  } catch (_) {
+    // no-op
+  }
+}
+
+
 // Optional: a global rate you can use in thresholds later if you want.
 // (Not required for the table.)
 const epAnyFailRate = new Rate("ep_any_fail_rate");
@@ -154,12 +180,15 @@ function recordEndpoint(epObj, res) {
   epObj.reqs.add(1);
   epObj.dur.add(res.timings.duration);
 
+  // Record global timing components for this request
+  recordTimingBreakdown(res);
+
   const failed = res.status < 200 || res.status >= 300;
   if (failed) epObj.fails.add(1);
 
-  // For a quick overall signal (optional)
   epAnyFailRate.add(failed ? 1 : 0);
 }
+
 
 function logDebug(msg, obj) {
   if (!DEBUG) return;
@@ -583,10 +612,25 @@ export function handleSummary(data) {
       ].join(" | ");
     })
     .join("\n");
+    // Keep default stdout summary AND append our table.
+    // ------------------------
+  // Global timing breakdown line
+  // ------------------------
+  const vConn = metricVals(data, "timing_connecting");
+  const vTls = metricVals(data, "timing_tls_handshaking");
+  const vWait = metricVals(data, "timing_waiting");
 
-  const text = header + lines + "\n\n";
+  const timingLine =
+    "\n=== TIMINGS breakdown (global) ===\n" +
+    fmtTimingLine("connecting", vConn) + "\n" +
+    fmtTimingLine("tls_handshaking", vTls) + "\n" +
+    fmtTimingLine("waiting", vWait) + "\n\n";
 
-  // Keep default stdout summary AND append our table.
+
+   const text = header + lines + "\n" + timingLine;
+
+
+  
   return {
     stdout: text,
   };
